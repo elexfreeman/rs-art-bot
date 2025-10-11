@@ -18,6 +18,7 @@ pub struct ImageStats {
 
 /// Декодирует bytes в изображение, вычисляет базовую статистику
 /// и компактную палитру доминирующих цветов.
+/// Функция анализирует изображение и возвращает `ImageStats`.
 pub fn analyze_image(bytes: &[u8]) -> Result<ImageStats> {
     let img = ImageReader::new(std::io::Cursor::new(bytes))
         .with_guessed_format()
@@ -38,6 +39,7 @@ pub fn analyze_image(bytes: &[u8]) -> Result<ImageStats> {
 
 /// Строит палитру доминирующих цветов: даунскейлим изображение,
 /// квантованием снижаем шум цветового пространства и считаем частоты.
+/// Функция вычисляет список доминирующих цветов изображения в HEX.
 fn dominant_colors(img: &DynamicImage, take: usize) -> Vec<String> {
     let mut counts = std::collections::HashMap::<(u8, u8, u8), u32>::new();
 
@@ -61,6 +63,7 @@ fn dominant_colors(img: &DynamicImage, take: usize) -> Vec<String> {
 }
 
 /// Определяет MIME‑тип по сигнатуре изображения.
+/// Функция определяет MIME‑тип изображения по его байтам.
 fn guess_mime(bytes: &[u8]) -> &'static str {
     match image::guess_format(bytes) {
         Ok(ImageFormat::Jpeg) => "image/jpeg",
@@ -76,6 +79,7 @@ fn guess_mime(bytes: &[u8]) -> &'static str {
 /// Генерирует подпись через OpenAI Vision: отправляем картинку как data URL
 /// и системный промпт под акварельные работы. Результат укорачиваем,
 /// чтобы уложиться в лимит подписи Telegram.
+/// Функция генерирует подпись с помощью OpenAI Vision по данным `stats` и байтам изображения.
 pub async fn generate_caption_openai_vision(stats: &ImageStats, bytes: &[u8]) -> Result<String> {
     let api_key = std::env::var("OPENAI_API_KEY").context("OPENAI_API_KEY is not set")?;
     let model = std::env::var("OPENAI_VISION_MODEL").unwrap_or_else(|_| std::env::var("OPENAI_MODEL").unwrap_or_else(|_| "gpt-4o-mini".to_string()));

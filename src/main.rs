@@ -19,6 +19,8 @@ use tokio::time::{interval, Duration};
 use time::OffsetDateTime;
 // duplicate imports removed
 
+/// Точка входа: загружает .env, настраивает логирование, подключает SQLite,
+/// запускает фоновые задачи (интервал/крон), регистрирует обработчики и запускает диспетчер.
 #[tokio::main]
 async fn main() -> Result<()> {
     // 1) Подхватить переменные окружения из .env, если файл присутствует
@@ -104,6 +106,7 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
+/// Фоновая публикация с фиксированным интервалом `every_secs` секунд.
 async fn run_periodic_poster(bot: Bot, db: std::sync::Arc<Db>, files_dir: String, every_secs: u64) {
     // Простой таймер, который раз в N секунд пытается опубликовать один новый файл
     let mut ticker = interval(Duration::from_secs(every_secs));
@@ -115,6 +118,7 @@ async fn run_periodic_poster(bot: Bot, db: std::sync::Arc<Db>, files_dir: String
     }
 }
 
+/// Фоновая публикация по расписанию `cron` в формате "M H * * *".
 async fn run_cron_poster(bot: Bot, db: std::sync::Arc<Db>, files_dir: String, cron: String) {
     // Поддерживаемый формат: "M H * * *", где M и H — число или '*'
     let spec = match parse_simple_cron(&cron) {
@@ -144,11 +148,13 @@ async fn run_cron_poster(bot: Bot, db: std::sync::Arc<Db>, files_dir: String, cr
     }
 }
 
+/// Простейшая крон-структура: минута и час (или любое значение).
 struct CronMinHour {
     minute: Option<u8>, // None = any
     hour: Option<u8>,   // None = any
 }
 
+/// Парсит строку крона формата "M H * * *" в структуру CronMinHour.
 fn parse_simple_cron(s: &str) -> Result<CronMinHour> {
     // Ждём ровно 5 полей, поддерживаем только минуту и час, остальные должны быть '*'
     let parts: Vec<_> = s.split_whitespace().collect();
@@ -161,6 +167,7 @@ fn parse_simple_cron(s: &str) -> Result<CronMinHour> {
     Ok(CronMinHour { minute, hour })
 }
 
+/// Парсит поле крона для минут/часов: `*` либо число u8.
 fn parse_field_minute_hour(v: &str) -> Result<Option<u8>> {
     // '*' означает любое значение, иначе парсим число
     if v == "*" { return Ok(None); }
@@ -168,11 +175,14 @@ fn parse_field_minute_hour(v: &str) -> Result<Option<u8>> {
     Ok(Some(n))
 }
 
+/// Проверяет совпадение текущих минут/часов с ограничениями CronMinHour.
 fn cron_match_min_hour(spec: &CronMinHour, minute: u8, hour: u8) -> bool {
     // Совпадение соблюдается, если каждое из ограничений либо пустое, либо равно текущему значению
     (spec.minute.map_or(true, |m| m == minute)) && (spec.hour.map_or(true, |h| h == hour))
 }
 
+/// Пытается найти и опубликовать один новый файл из папки `files_dir`.
+/// Выбирает по имени, пропускает уже виденные по SHA‑256, публикует и логирует.
 async fn try_post_from_folder(bot: &Bot, db: &std::sync::Arc<Db>, files_dir: &str) -> Result<()> {
     // 1) Убедиться, что задан канал для публикации
     let Some(channel_id) = db.get_channel_id().await? else {
@@ -272,6 +282,7 @@ enum BotCommand {
     Settings,
 }
 
+/// Обработчик команд: /help, /start, /set_channel, /settings.
 async fn handle_commands(
     bot: Bot,
     msg: Message,
@@ -330,6 +341,8 @@ async fn handle_commands(
     Ok(())
 }
 
+/// Обработчик входящего фото: скачивает байты, анализирует и генерирует подпись через Vision,
+/// публикует в канал, пишет лог публикации и отправляет подтверждение пользователю.
 async fn handle_photo(
     bot: Bot,
     msg: Message,
