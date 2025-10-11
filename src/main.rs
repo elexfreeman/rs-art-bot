@@ -11,7 +11,7 @@ use teloxide::utils::command::BotCommands as _; // bring trait into scope for de
 use tracing::{debug, error, info, warn};
 
 use crate::db::Db;
-use crate::generator::{analyze_image, generate_caption};
+use crate::generator::{analyze_image, generate_caption_openai_vision};
 use sha2::{Digest, Sha256};
 use tokio::time::{interval, Duration};
 use time::OffsetDateTime;
@@ -213,7 +213,7 @@ async fn try_post_from_folder(bot: &Bot, db: &std::sync::Arc<Db>, files_dir: &st
 
         // Prepare caption
         let stats = analyze_image(&bytes)?;
-        let caption = match generate_caption(&stats, Some(&bytes)).await {
+        let caption = match generate_caption_openai_vision(&stats, &bytes).await {
             Ok(c) => c,
             Err(err) => { warn!(error = %err, "periodic post: caption failed, using empty"); String::new() }
         };
@@ -368,7 +368,7 @@ async fn handle_photo(
     // Analyze image and generate caption (Vision if enabled)
      let stats = analyze_image(&bytes)?;
      debug!(w = stats.width, h = stats.height, colors = stats.dominant_hex.len(), "Image analyzed");
-     let caption = match generate_caption(&stats, Some(&bytes)).await {
+     let caption = match generate_caption_openai_vision(&stats, &bytes).await {
          Ok(c) => {
              info!("out = {}", c);
              info!(len = c.len(), "Caption generated");
