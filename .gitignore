@@ -1,0 +1,6 @@
+/target
+tmp_sync
+files
+commands
+.env
+config.json
