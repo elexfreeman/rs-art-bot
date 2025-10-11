@@ -28,7 +28,7 @@ pub fn analyze_image(bytes: &[u8]) -> Result<ImageStats> {
 
     let (w, h) = img.dimensions();
     let palette = dominant_colors(&img, 3);
-    debug!(width = w, height = h, colors = palette.len(), "analyze_image: computed stats");
+    debug!(width = w, height = h, colors = palette.len(), "analyze_image: рассчитана статистика");
 
     Ok(ImageStats {
         width: w,
@@ -81,10 +81,10 @@ fn guess_mime(bytes: &[u8]) -> &'static str {
 /// чтобы уложиться в лимит подписи Telegram.
 /// Функция генерирует подпись с помощью OpenAI Vision по данным `stats` и байтам изображения.
 pub async fn generate_caption_openai_vision(stats: &ImageStats, bytes: &[u8]) -> Result<String> {
-    let api_key = std::env::var("OPENAI_API_KEY").context("OPENAI_API_KEY is not set")?;
+    let api_key = std::env::var("OPENAI_API_KEY").context("переменная OPENAI_API_KEY не задана")?;
     let model = std::env::var("OPENAI_VISION_MODEL").unwrap_or_else(|_| std::env::var("OPENAI_MODEL").unwrap_or_else(|_| "gpt-4o-mini".to_string()));
     let base = std::env::var("OPENAI_BASE").unwrap_or_else(|_| "https://api.openai.com".to_string());
-    debug!(model = %model, base = %base, "OpenAI vision request");
+    debug!(model = %model, base = %base, "Запрос к OpenAI Vision");
 
     // Сформируем небольшой контекст по тонам (если есть)
     let tones = if stats.dominant_hex.is_empty() { "неопределены".to_string() } else { stats.dominant_hex.join(", ") };
@@ -124,18 +124,18 @@ pub async fn generate_caption_openai_vision(stats: &ImageStats, bytes: &[u8]) ->
         .json(&body)
         .send()
         .await
-        .context("openai vision request failed")?;
+        .context("ошибка запроса к OpenAI Vision")?;
 
     let status = resp.status();
-    let val: serde_json::Value = resp.json().await.context("invalid openai json")?;
+    let val: serde_json::Value = resp.json().await.context("некорректный JSON от OpenAI")?;
     if !status.is_success() {
-        warn!(status = %status, body = %val, "OpenAI vision error");
+        warn!(status = %status, body = %val, "Ошибка OpenAI Vision");
         return Err(anyhow!("openai error: {}", val));
     }
     // Достаём текст ассистента и ограничиваем ~1000 символов
     let content = val["choices"][0]["message"]["content"].as_str()
         .ok_or_else(|| anyhow!("openai response missing content"))?;
     let capped = content.chars().take(1000).collect::<String>();
-    debug!(len = capped.len(), "OpenAI vision response parsed");
+    debug!(len = capped.len(), "Ответ OpenAI Vision обработан");
     Ok(capped)
 }

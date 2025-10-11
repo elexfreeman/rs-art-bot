@@ -35,7 +35,7 @@ async fn main() -> Result<()> {
 
     // 4) Подключить SQLite: открыть/создать базу и применить схему
     let db_path = std::env::var("DB_PATH").unwrap_or_else(|_| "bot.db".to_string());
-    let db = Db::open(&db_path).await.context("failed to open sqlite db")?;
+    let db = Db::open(&db_path).await.context("не удалось открыть базу SQLite")?;
     let db = std::sync::Arc::new(db);
 
     // 5) Если channel_id ещё не задан в БД — взять стартовое значение из .env (CHANNEL_ID)
@@ -77,10 +77,10 @@ async fn main() -> Result<()> {
             info!(
                 id = me.id.0,
                 username = me.user.username.as_deref().unwrap_or(""),
-                "Bot started"
+                "Бот запущен"
             );
         }
-        Err(err) => warn!(error = %err, "Failed to fetch bot info"),
+        Err(err) => warn!(error = %err, "Не удалось получить информацию о боте"),
     }
 
     // 8) Сконструировать дерево обработчиков: команды и фото
@@ -113,7 +113,7 @@ async fn run_periodic_poster(bot: Bot, db: std::sync::Arc<Db>, files_dir: String
     loop {
         ticker.tick().await;
         if let Err(err) = try_post_from_folder(&bot, &db, &files_dir).await {
-            warn!(error = %err, "periodic post: error");
+            warn!(error = %err, "Ошибка периодической публикации");
         }
     }
 }
@@ -124,7 +124,7 @@ async fn run_cron_poster(bot: Bot, db: std::sync::Arc<Db>, files_dir: String, cr
     let spec = match parse_simple_cron(&cron) {
         Ok(s) => s,
         Err(e) => {
-            warn!(error = %e, value = %cron, "cron: invalid expression, skipping");
+            warn!(error = %e, value = %cron, "Некорректное выражение cron, пропускаем");
             return;
         }
     };
@@ -142,7 +142,7 @@ async fn run_cron_poster(bot: Bot, db: std::sync::Arc<Db>, files_dir: String, cr
         if cron_match_min_hour(&spec, m as u8, h as u8) {
             last_minute = Some(m);
             if let Err(err) = try_post_from_folder(&bot, &db, &files_dir).await {
-                warn!(error = %err, "cron post: error");
+                warn!(error = %err, "Ошибка публикации по cron");
             }
         }
     }
@@ -171,7 +171,7 @@ fn parse_simple_cron(s: &str) -> Result<CronMinHour> {
 fn parse_field_minute_hour(v: &str) -> Result<Option<u8>> {
     // '*' означает любое значение, иначе парсим число
     if v == "*" { return Ok(None); }
-    let n: u8 = v.parse().context("invalid number in cron")?;
+    let n: u8 = v.parse().context("некорректное число в cron")?;
     Ok(Some(n))
 }
 
@@ -186,7 +186,7 @@ fn cron_match_min_hour(spec: &CronMinHour, minute: u8, hour: u8) -> bool {
 async fn try_post_from_folder(bot: &Bot, db: &std::sync::Arc<Db>, files_dir: &str) -> Result<()> {
     // 1) Убедиться, что задан канал для публикации
     let Some(channel_id) = db.get_channel_id().await? else {
-        debug!("periodic post: channel not configured, skipping");
+        debug!("Канал не настроен, пропускаем");
         return Ok(());
     };
 
@@ -199,7 +199,7 @@ async fn try_post_from_folder(bot: &Bot, db: &std::sync::Arc<Db>, files_dir: &st
             }
         }
         Err(err) => {
-            warn!(dir = files_dir, error = %err, "periodic post: cannot read dir");
+            warn!(dir = files_dir, error = %err, "Не удалось прочитать каталог файлов");
             return Ok(());
         }
     }
@@ -224,14 +224,14 @@ async fn try_post_from_folder(bot: &Bot, db: &std::sync::Arc<Db>, files_dir: &st
         // 5) Прочитать файл и посчитать SHA‑256, чтобы избежать повторов
         let bytes = match tokio::fs::read(&path).await {
             Ok(b) => b,
-            Err(err) => { warn!(file = ?path, error = %err, "periodic post: read failed"); continue; }
+            Err(err) => { warn!(file = ?path, error = %err, "Ошибка чтения файла"); continue; }
         };
         let mut hasher = Sha256::new();
         hasher.update(&bytes);
         let hash = format!("{:x}", hasher.finalize());
 
         if db.has_file_hash(&hash).await? {
-            debug!(file = ?path, "periodic post: already posted, skip");
+            debug!(file = ?path, "Файл уже опубликован, пропускаем");
             continue;
         }
 
@@ -239,7 +239,7 @@ async fn try_post_from_folder(bot: &Bot, db: &std::sync::Arc<Db>, files_dir: &st
         let stats = analyze_image(&bytes)?;
         let caption = match generate_caption_openai_vision(&stats, &bytes).await {
             Ok(c) => c,
-            Err(err) => { warn!(error = %err, "periodic post: caption failed, using empty"); String::new() }
+            Err(err) => { warn!(error = %err, "Не удалось сгенерировать подпись, используем пустую"); String::new() }
         };
 
         // 7) Отправить фото в канал (с диска)
@@ -261,7 +261,7 @@ async fn try_post_from_folder(bot: &Bot, db: &std::sync::Arc<Db>, files_dir: &st
         db.log_post(channel_id, Some(sent.id.0 as i64), file_id, Some(caption)).await?;
         db.insert_file_hash(&hash, path.to_string_lossy().as_ref()).await?;
 
-        info!(?path, "periodic post: posted one file");
+        info!(?path, "Опубликован один файл");
         // Post only one per tick
         break;
     }
@@ -290,12 +290,12 @@ async fn handle_commands(
     db: std::sync::Arc<Db>,
 ) -> Result<()> {
     // Диспетчер команд: логируем и обрабатываем согласно enum BotCommand
-    info!(chat_id = %msg.chat.id, from = ?msg.from.as_ref().map(|u| u.id.0), command = ?cmd, "Command received");
+    info!(chat_id = %msg.chat.id, from = ?msg.from.as_ref().map(|u| u.id.0), command = ?cmd, "Получена команда");
     match cmd {
         BotCommand::Help => {
             // Автоматически сгенерированное описание команд
             let text = BotCommand::descriptions().to_string();
-            debug!(len = text.len(), "Sending help");
+            debug!(len = text.len(), "Отправка помощи");
             bot.send_message(msg.chat.id, text)
                 .await?;
         }
@@ -313,12 +313,12 @@ async fn handle_commands(
                 Ok(id) => {
                     // Persist to SQLite as well
                     db.set_channel_id(id).await?;
-                    info!(chat_id = %msg.chat.id, channel_id = id, "Channel set");
+                    info!(chat_id = %msg.chat.id, channel_id = id, "Канал установлен");
                     bot.send_message(msg.chat.id, format!("Канал установлен: {}", trimmed))
                         .await?;
                 }
                 Err(_) => {
-                    warn!(chat_id = %msg.chat.id, value = trimmed, "Invalid channel id format");
+                    warn!(chat_id = %msg.chat.id, value = trimmed, "Некорректный формат ID канала");
                     bot.send_message(
                         msg.chat.id,
                         "Укажите числовой ID канала (например -1001234567890).",
@@ -334,7 +334,7 @@ async fn handle_commands(
                 Some(id) => format!("Канал: {}", id),
                 None => "Канал не настроен. Используйте /set_channel <id>".to_string(),
             };
-            debug!(chat_id = %msg.chat.id, "Sending settings");
+            debug!(chat_id = %msg.chat.id, "Отправка настроек");
             bot.send_message(msg.chat.id, text).await?;
         }
     }
@@ -364,13 +364,13 @@ async fn handle_photo(
         chosen_w = best.width,
         chosen_h = best.height,
         file_id = %best.file.id,
-        "Photo received"
+        "Получено фото"
     );
 
     // Убедимся, что канал настроен
     let channel_id = db.get_channel_id().await?;
     if channel_id.is_none() {
-        warn!(chat_id = %msg.chat.id, "Channel not configured");
+        warn!(chat_id = %msg.chat.id, "Канал не настроен");
         bot.send_message(
             msg.chat.id,
             "Сначала настройте канал: /set_channel -1001234567890",
@@ -387,39 +387,39 @@ async fn handle_photo(
         "https://api.telegram.org/file/bot{}/{}",
         token, file.path
     );
-    debug!(%file_url, "Downloading image");
+    debug!(%file_url, "Скачивание изображения");
     let bytes = reqwest::Client::new()
         .get(file_url)
         .send()
         .await
-        .context("failed to download image")?
+        .context("не удалось скачать изображение")?
         .bytes()
         .await
-        .context("failed to read image bytes")?;
-    debug!(size = bytes.len(), "Image downloaded");
+        .context("не удалось прочитать байты изображения")?;
+    debug!(size = bytes.len(), "Изображение скачано");
 
     // Анализ изображения и генерация подписи через OpenAI Vision
      let stats = analyze_image(&bytes)?;
-     debug!(w = stats.width, h = stats.height, colors = stats.dominant_hex.len(), "Image analyzed");
+     debug!(w = stats.width, h = stats.height, colors = stats.dominant_hex.len(), "Изображение проанализировано");
      let caption = match generate_caption_openai_vision(&stats, &bytes).await {
          Ok(c) => {
-             info!("out = {}", c);
-             info!(len = c.len(), "Caption generated");
+             info!("результат = {}", c);
+             info!(len = c.len(), "Подпись сгенерирована");
              c
          }
          Err(err) => {
-             error!(error = %err, "Caption generation failed, using empty");
+             error!(error = %err, "Не удалось сгенерировать подпись, используем пустую");
              String::new()
          }
      };
 
     // Публикуем в канал: переиспользуем file_id исходного фото, чтобы не перезагружать файл
-    info!(channel_id, "Posting to channel");
+    info!(channel_id, "Публикация в канал");
     // let caption = String::from("HEllow");
     let sent = bot.send_photo(teloxide::types::ChatId(channel_id), teloxide::types::InputFile::file_id(best.file.id.clone()))
         .caption(caption.clone())
         .await?;
-    info!(channel_id, "Posted to channel");
+    info!(channel_id, "Опубликовано в канал");
 
     // Log publication to SQLite
     let msg_id = sent.id.0;
