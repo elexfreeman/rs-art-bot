@@ -1,4 +1,3 @@
-mod config;
 mod generator;
 mod db;
 
@@ -11,7 +10,6 @@ use teloxide::requests::Requester;
 use teloxide::utils::command::BotCommands as _; // bring trait into scope for descriptions()
 use tracing::{debug, error, info, warn};
 
-use crate::config::Config;
 use crate::db::Db;
 use crate::generator::{analyze_image, generate_caption};
 use sha2::{Digest, Sha256};
@@ -30,28 +28,6 @@ async fn main() -> Result<()> {
     // teloxide reads TELOXIDE_TOKEN from env by default
     let bot = Bot::from_env();
 
-    // Parse CLI args for --config-json
-    let mut config_json_arg: Option<String> = None;
-    for arg in std::env::args().skip(1) {
-        if let Some(rest) = arg.strip_prefix("--config-json=") {
-            config_json_arg = Some(rest.to_string());
-            break;
-        }
-        if arg == "--config-json" {
-            // support next-arg form
-            config_json_arg = std::env::args().skip_while(|a| a != "--config-json").nth(1);
-            break;
-        }
-    }
-
-    let config = if let Some(json) = config_json_arg {
-        info!("Loading config from --config-json");
-        Config::from_json_str(&json).context("failed to parse --config-json")?
-    } else {
-        Config::load().context("failed to load config")?
-    };
-    let config_storage = std::sync::Arc::new(tokio::sync::RwLock::new(config));
-
     // Initialize SQLite database
     let db_path = std::env::var("DB_PATH").unwrap_or_else(|_| "bot.db".to_string());
     let db = Db::open(&db_path).await.context("failed to open sqlite db")?;
@@ -59,10 +35,8 @@ async fn main() -> Result<()> {
 
     // Seed DB channel_id from config if present and DB empty
     if db.get_channel_id().await?.is_none() {
-        let cfg = config_storage.read().await;
-        if let Some(id) = cfg.channel_id {
-            db.set_channel_id(id).await?;
-        }
+        let env_channel = std::env::var("CHANNEL_ID").ok().and_then(|v| v.parse::<i64>().ok());
+        if let Some(id) = env_channel { db.set_channel_id(id).await?; }
     }
 
     // Background poster from local folder
@@ -79,7 +53,7 @@ async fn main() -> Result<()> {
         });
     } else {
         // Use cron from config if provided
-        let cron_expr = { config_storage.read().await.post_cron.clone() };
+        let cron_expr = std::env::var("POST_CRON").ok();
         if let Some(expr) = cron_expr {
             let bot_bg = bot.clone();
             let db_bg = db.clone();
@@ -114,7 +88,7 @@ async fn main() -> Result<()> {
         );
 
     Dispatcher::builder(bot, handler)
-        .dependencies(dptree::deps![config_storage, db])
+        .dependencies(dptree::deps![db])
         .enable_ctrlc_handler()
         .build()
         .dispatch()
@@ -288,7 +262,6 @@ async fn handle_commands(
     bot: Bot,
     msg: Message,
     cmd: BotCommand,
-    cfg: std::sync::Arc<tokio::sync::RwLock<Config>>,
     db: std::sync::Arc<Db>,
 ) -> Result<()> {
     info!(chat_id = %msg.chat.id, from = ?msg.from.as_ref().map(|u| u.id.0), command = ?cmd, "Command received");
@@ -309,11 +282,6 @@ async fn handle_commands(
             let parsed = trimmed.parse::<i64>();
             match parsed {
                 Ok(id) => {
-                    {
-                        let mut guard = cfg.write().await;
-                        guard.channel_id = Some(id);
-                        guard.save()?;
-                    }
                     // Persist to SQLite as well
                     db.set_channel_id(id).await?;
                     info!(chat_id = %msg.chat.id, channel_id = id, "Channel set");
@@ -332,9 +300,7 @@ async fn handle_commands(
         }
         BotCommand::Settings => {
             let from_db = db.get_channel_id().await?;
-            let fallback = if from_db.is_none() { cfg.read().await.channel_id } else { None };
-            let effective = from_db.or(fallback);
-            let text = match effective {
+            let text = match from_db {
                 Some(id) => format!("Канал: {}", id),
                 None => "Канал не настроен. Используйте /set_channel <id>".to_string(),
             };
@@ -348,7 +314,6 @@ async fn handle_commands(
 async fn handle_photo(
     bot: Bot,
     msg: Message,
-    cfg: std::sync::Arc<tokio::sync::RwLock<Config>>,
     db: std::sync::Arc<Db>,
 ) -> Result<()> {
     let Some(photos) = msg.photo() else { return Ok(()); };
