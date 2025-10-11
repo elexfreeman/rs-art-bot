@@ -7,6 +7,7 @@ pub struct Db {
 }
 
 impl Db {
+    /// Open or create a SQLite database at `path` and ensure schema is present.
     pub async fn open(path: &str) -> Result<Self> {
         let conn = Connection::open(path).await?;
         let db = Self { conn };
@@ -14,6 +15,10 @@ impl Db {
         Ok(db)
     }
 
+    /// Initialize DB schema (idempotent):
+    /// - `config` for key/value pairs (stores `channel_id`)
+    /// - `posts`  log of published messages
+    /// - `files`  registry of processed files by SHA-256 hash
     async fn init(&self) -> Result<()> {
         self.conn
             .call(|conn| {
@@ -45,6 +50,8 @@ impl Db {
         Ok(())
     }
 
+    /// Read the saved channel id from `config` table.
+    /// Returns `Ok(None)` if not set yet.
     pub async fn get_channel_id(&self) -> Result<Option<i64>> {
         let val: Option<String> = self
             .conn
@@ -66,6 +73,7 @@ impl Db {
         })
     }
 
+    /// Upsert channel id into the `config` table.
     pub async fn set_channel_id(&self, id: i64) -> Result<()> {
         self.conn
             .call(move |conn| {
@@ -80,6 +88,7 @@ impl Db {
         Ok(())
     }
 
+    /// Insert a publication record into `posts` for audit/debugging purposes.
     pub async fn log_post(&self, channel_id: i64, message_id: Option<i64>, file_id: Option<String>, caption: Option<String>) -> Result<()> {
         self.conn
             .call(move |conn| {
@@ -93,6 +102,8 @@ impl Db {
         Ok(())
     }
 
+    /// Check if a file hash is already present in `files` table.
+    /// Used to skip re-posting the same image from the filesystem.
     pub async fn has_file_hash(&self, hash: &str) -> Result<bool> {
         let h = hash.to_string();
         let exists: bool = self
@@ -106,6 +117,8 @@ impl Db {
         Ok(exists)
     }
 
+    /// Insert a file hash (and optional path) into `files` table.
+    /// This operation is idempotent via INSERT OR IGNORE.
     pub async fn insert_file_hash(&self, hash: &str, path: &str) -> Result<()> {
         let h = hash.to_string();
         let p = path.to_string();

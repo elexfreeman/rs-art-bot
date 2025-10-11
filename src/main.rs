@@ -1,3 +1,5 @@
+// Основной исполняемый модуль: запускает бота, настраивает логирование,
+// подключает SQLite, поднимает обработчики и фоновые задачи (интервал/крон).
 mod generator;
 mod db;
 
@@ -19,27 +21,30 @@ use time::OffsetDateTime;
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // 1) Подхватить переменные окружения из .env, если файл присутствует
     dotenvy::dotenv().ok();
-    // Init tracing with env filter, e.g. RUST_LOG=info,reqwest=warn
+    // 2) Инициализировать логирование через tracing с возможностью управлять уровнем через RUST_LOG
     let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info,reqwest=warn,teloxide=info"));
     tracing_subscriber::fmt().with_env_filter(env_filter).compact().init();
 
-    // teloxide reads TELOXIDE_TOKEN from env by default
+    // 3) Инициализировать Telegram‑бота: токен читается из переменной TELOXIDE_TOKEN
     let bot = Bot::from_env();
 
-    // Initialize SQLite database
+    // 4) Подключить SQLite: открыть/создать базу и применить схему
     let db_path = std::env::var("DB_PATH").unwrap_or_else(|_| "bot.db".to_string());
     let db = Db::open(&db_path).await.context("failed to open sqlite db")?;
     let db = std::sync::Arc::new(db);
 
-    // Seed DB channel_id from config if present and DB empty
+    // 5) Если channel_id ещё не задан в БД — взять стартовое значение из .env (CHANNEL_ID)
     if db.get_channel_id().await?.is_none() {
         let env_channel = std::env::var("CHANNEL_ID").ok().and_then(|v| v.parse::<i64>().ok());
         if let Some(id) = env_channel { db.set_channel_id(id).await?; }
     }
 
-    // Background poster from local folder
+    // 6) Запустить фоновую публикацию из папки:
+    //    - либо по интервалу (POST_INTERVAL_SECS),
+    //    - либо по крону (POST_CRON вида "M H * * *").
     let files_dir = std::env::var("FILES_DIR").unwrap_or_else(|_| "files".to_string());
     let post_interval_secs = std::env::var("POST_INTERVAL_SECS")
         .ok()
@@ -64,7 +69,7 @@ async fn main() -> Result<()> {
         }
     }
 
-    // Log bot identity
+    // 7) Для наглядности — вывести информацию о боте
     match bot.get_me().await {
         Ok(me) => {
             info!(
@@ -76,6 +81,7 @@ async fn main() -> Result<()> {
         Err(err) => warn!(error = %err, "Failed to fetch bot info"),
     }
 
+    // 8) Сконструировать дерево обработчиков: команды и фото
     let handler = Update::filter_message()
         .branch(
             dptree::entry()
@@ -87,6 +93,7 @@ async fn main() -> Result<()> {
                 .endpoint(handle_photo),
         );
 
+    // 9) Запустить диспетчер: передаём зависимостью `db`
     Dispatcher::builder(bot, handler)
         .dependencies(dptree::deps![db])
         .enable_ctrlc_handler()
@@ -98,6 +105,7 @@ async fn main() -> Result<()> {
 }
 
 async fn run_periodic_poster(bot: Bot, db: std::sync::Arc<Db>, files_dir: String, every_secs: u64) {
+    // Простой таймер, который раз в N секунд пытается опубликовать один новый файл
     let mut ticker = interval(Duration::from_secs(every_secs));
     loop {
         ticker.tick().await;
@@ -108,7 +116,7 @@ async fn run_periodic_poster(bot: Bot, db: std::sync::Arc<Db>, files_dir: String
 }
 
 async fn run_cron_poster(bot: Bot, db: std::sync::Arc<Db>, files_dir: String, cron: String) {
-    // Supported format: "M H * * *" where M and H are either number or '*'
+    // Поддерживаемый формат: "M H * * *", где M и H — число или '*'
     let spec = match parse_simple_cron(&cron) {
         Ok(s) => s,
         Err(e) => {
@@ -117,6 +125,8 @@ async fn run_cron_poster(bot: Bot, db: std::sync::Arc<Db>, files_dir: String, cr
         }
     };
 
+    // Чтобы один и тот же запуск не сработал несколько раз за минуту,
+    // запомним последнюю обработанную минуту.
     let mut last_minute: Option<i32> = None;
     let mut ticker = interval(Duration::from_secs(20));
     loop {
@@ -140,6 +150,7 @@ struct CronMinHour {
 }
 
 fn parse_simple_cron(s: &str) -> Result<CronMinHour> {
+    // Ждём ровно 5 полей, поддерживаем только минуту и час, остальные должны быть '*'
     let parts: Vec<_> = s.split_whitespace().collect();
     if parts.len() != 5 { anyhow::bail!("cron must have 5 fields"); }
     let minute = parse_field_minute_hour(parts[0])?;
@@ -151,23 +162,25 @@ fn parse_simple_cron(s: &str) -> Result<CronMinHour> {
 }
 
 fn parse_field_minute_hour(v: &str) -> Result<Option<u8>> {
+    // '*' означает любое значение, иначе парсим число
     if v == "*" { return Ok(None); }
     let n: u8 = v.parse().context("invalid number in cron")?;
     Ok(Some(n))
 }
 
 fn cron_match_min_hour(spec: &CronMinHour, minute: u8, hour: u8) -> bool {
+    // Совпадение соблюдается, если каждое из ограничений либо пустое, либо равно текущему значению
     (spec.minute.map_or(true, |m| m == minute)) && (spec.hour.map_or(true, |h| h == hour))
 }
 
 async fn try_post_from_folder(bot: &Bot, db: &std::sync::Arc<Db>, files_dir: &str) -> Result<()> {
-    // Ensure channel configured
+    // 1) Убедиться, что задан канал для публикации
     let Some(channel_id) = db.get_channel_id().await? else {
         debug!("periodic post: channel not configured, skipping");
         return Ok(());
     };
 
-    // List files
+    // 2) Прочитать список файлов из папки
     let mut entries = Vec::new();
     match tokio::fs::read_dir(files_dir).await {
         Ok(mut rd) => {
@@ -183,10 +196,10 @@ async fn try_post_from_folder(bot: &Bot, db: &std::sync::Arc<Db>, files_dir: &st
 
     if entries.is_empty() { return Ok(()); }
 
-    // Sort by path name for determinism
+    // 3) Отсортировать по имени для детерминированного порядка
     entries.sort_by_key(|e| e.path());
 
-    // Allowed extensions
+    // 4) Фильтровать по поддерживаемым расширениям
     fn is_image(p: &std::path::Path) -> bool {
         match p.extension().and_then(|s| s.to_str()).map(|s| s.to_lowercase()) {
             Some(ext) if matches!(ext.as_str(), "jpg"|"jpeg"|"png"|"webp"|"gif"|"bmp"|"tiff") => true,
@@ -198,6 +211,7 @@ async fn try_post_from_folder(bot: &Bot, db: &std::sync::Arc<Db>, files_dir: &st
         let path = e.path();
         if !is_image(&path) { continue; }
 
+        // 5) Прочитать файл и посчитать SHA‑256, чтобы избежать повторов
         let bytes = match tokio::fs::read(&path).await {
             Ok(b) => b,
             Err(err) => { warn!(file = ?path, error = %err, "periodic post: read failed"); continue; }
@@ -211,14 +225,14 @@ async fn try_post_from_folder(bot: &Bot, db: &std::sync::Arc<Db>, files_dir: &st
             continue;
         }
 
-        // Prepare caption
+        // 6) Подготовить подпись: анализ изображения + вызов Vision
         let stats = analyze_image(&bytes)?;
         let caption = match generate_caption_openai_vision(&stats, &bytes).await {
             Ok(c) => c,
             Err(err) => { warn!(error = %err, "periodic post: caption failed, using empty"); String::new() }
         };
 
-        // Send to channel
+        // 7) Отправить фото в канал (с диска)
         let sent = bot
             .send_photo(
                 teloxide::types::ChatId(channel_id),
@@ -227,13 +241,13 @@ async fn try_post_from_folder(bot: &Bot, db: &std::sync::Arc<Db>, files_dir: &st
             .caption(caption.clone())
             .await?;
 
-        // Extract Telegram file_id if present
+        // 8) Извлечь Telegram file_id итогового фото (если есть)
         let file_id = sent
             .photo()
             .and_then(|v| v.last())
             .map(|p| p.file.id.to_string());
 
-        // Log and store hash
+        // 9) Записать лог публикации и сохранить хэш файла
         db.log_post(channel_id, Some(sent.id.0 as i64), file_id, Some(caption)).await?;
         db.insert_file_hash(&hash, path.to_string_lossy().as_ref()).await?;
 
@@ -264,19 +278,23 @@ async fn handle_commands(
     cmd: BotCommand,
     db: std::sync::Arc<Db>,
 ) -> Result<()> {
+    // Диспетчер команд: логируем и обрабатываем согласно enum BotCommand
     info!(chat_id = %msg.chat.id, from = ?msg.from.as_ref().map(|u| u.id.0), command = ?cmd, "Command received");
     match cmd {
         BotCommand::Help => {
+            // Автоматически сгенерированное описание команд
             let text = BotCommand::descriptions().to_string();
             debug!(len = text.len(), "Sending help");
             bot.send_message(msg.chat.id, text)
                 .await?;
         }
         BotCommand::Start => {
+            // Короткое приветствие/проверка готовности
             bot.send_message(msg.chat.id, "Бот готов. Отправьте фото акварельной картины — я создам продающий текст и опубликую в канал.")
                 .await?;
         }
         BotCommand::SetChannel(raw) => {
+            // Устанавливаем числовой ID канала и сохраняем в SQLite
             let trimmed = raw.trim();
             // Require numeric chat id for reliability (-100...) 
             let parsed = trimmed.parse::<i64>();
@@ -299,6 +317,7 @@ async fn handle_commands(
             }
         }
         BotCommand::Settings => {
+            // Показываем текущий канал из БД
             let from_db = db.get_channel_id().await?;
             let text = match from_db {
                 Some(id) => format!("Канал: {}", id),
@@ -316,6 +335,7 @@ async fn handle_photo(
     msg: Message,
     db: std::sync::Arc<Db>,
 ) -> Result<()> {
+    // Обрабатываем только сообщения с фото
     let Some(photos) = msg.photo() else { return Ok(()); };
 
     // Choose the biggest photo variant
@@ -334,7 +354,7 @@ async fn handle_photo(
         "Photo received"
     );
 
-    // Ensure channel configured
+    // Убедимся, что канал настроен
     let channel_id = db.get_channel_id().await?;
     if channel_id.is_none() {
         warn!(chat_id = %msg.chat.id, "Channel not configured");
@@ -347,7 +367,7 @@ async fn handle_photo(
     }
     let channel_id = channel_id.unwrap();
 
-    // Download file bytes for analysis
+    // Скачиваем оригинальные байты фото для анализа (Vision получает data URL)
     let file = bot.get_file(best.file.id.clone()).await?;
     let token = std::env::var("TELOXIDE_TOKEN").unwrap_or_default();
     let file_url = format!(
@@ -365,7 +385,7 @@ async fn handle_photo(
         .context("failed to read image bytes")?;
     debug!(size = bytes.len(), "Image downloaded");
 
-    // Analyze image and generate caption (Vision if enabled)
+    // Анализ изображения и генерация подписи через OpenAI Vision
      let stats = analyze_image(&bytes)?;
      debug!(w = stats.width, h = stats.height, colors = stats.dominant_hex.len(), "Image analyzed");
      let caption = match generate_caption_openai_vision(&stats, &bytes).await {
@@ -380,7 +400,7 @@ async fn handle_photo(
          }
      };
 
-    // Post to the channel using the same file_id to avoid re-upload
+    // Публикуем в канал: переиспользуем file_id исходного фото, чтобы не перезагружать файл
     info!(channel_id, "Posting to channel");
     // let caption = String::from("HEllow");
     let sent = bot.send_photo(teloxide::types::ChatId(channel_id), teloxide::types::InputFile::file_id(best.file.id.clone()))
@@ -393,7 +413,7 @@ async fn handle_photo(
     let file_id = Some(best.file.id.to_string());
     db.log_post(channel_id, Some(msg_id as i64), file_id, Some(caption)).await?;
 
-    // Confirm to the user
+    // Подтверждаем пользователю публикацию
     bot.send_message(
         msg.chat.id,
         "Пост опубликован в канал. Спасибо!",

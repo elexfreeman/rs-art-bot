@@ -6,6 +6,9 @@ use base64::{engine::general_purpose, Engine as _};
 use image::ImageFormat;
 use tracing::{debug, info, warn};
 
+/// Небольшой набор метрик изображения для генерации подписи.
+/// - `width`/`height` — габариты изображения
+/// - `dominant_hex` — несколько доминирующих оттенков в HEX
 #[derive(Debug, Clone)]
 pub struct ImageStats {
     pub width: u32,
@@ -13,6 +16,8 @@ pub struct ImageStats {
     pub dominant_hex: Vec<String>,
 }
 
+/// Декодирует bytes в изображение, вычисляет базовую статистику
+/// и компактную палитру доминирующих цветов.
 pub fn analyze_image(bytes: &[u8]) -> Result<ImageStats> {
     let img = ImageReader::new(std::io::Cursor::new(bytes))
         .with_guessed_format()
@@ -31,6 +36,8 @@ pub fn analyze_image(bytes: &[u8]) -> Result<ImageStats> {
     })
 }
 
+/// Строит палитру доминирующих цветов: даунскейлим изображение,
+/// квантованием снижаем шум цветового пространства и считаем частоты.
 fn dominant_colors(img: &DynamicImage, take: usize) -> Vec<String> {
     let mut counts = std::collections::HashMap::<(u8, u8, u8), u32>::new();
 
@@ -53,6 +60,7 @@ fn dominant_colors(img: &DynamicImage, take: usize) -> Vec<String> {
         .collect()
 }
 
+/// Определяет MIME‑тип по сигнатуре изображения.
 fn guess_mime(bytes: &[u8]) -> &'static str {
     match image::guess_format(bytes) {
         Ok(ImageFormat::Jpeg) => "image/jpeg",
@@ -65,12 +73,16 @@ fn guess_mime(bytes: &[u8]) -> &'static str {
     }
 }
 
+/// Генерирует подпись через OpenAI Vision: отправляем картинку как data URL
+/// и системный промпт под акварельные работы. Результат укорачиваем,
+/// чтобы уложиться в лимит подписи Telegram.
 pub async fn generate_caption_openai_vision(stats: &ImageStats, bytes: &[u8]) -> Result<String> {
     let api_key = std::env::var("OPENAI_API_KEY").context("OPENAI_API_KEY is not set")?;
     let model = std::env::var("OPENAI_VISION_MODEL").unwrap_or_else(|_| std::env::var("OPENAI_MODEL").unwrap_or_else(|_| "gpt-4o-mini".to_string()));
     let base = std::env::var("OPENAI_BASE").unwrap_or_else(|_| "https://api.openai.com".to_string());
     debug!(model = %model, base = %base, "OpenAI vision request");
 
+    // Сформируем небольшой контекст по тонам (если есть)
     let tones = if stats.dominant_hex.is_empty() { "неопределены".to_string() } else { stats.dominant_hex.join(", ") };
     let system = "Ты генерируешь описание для поста в соцсеть.
 Ты професиональный составитель текстов для описания картин, выдающийся эксперт в этой области.
@@ -82,10 +94,12 @@ pub async fn generate_caption_openai_vision(stats: &ImageStats, bytes: &[u8]) ->
 В конце каждого поста добавляй добрые и радостные пожелания подписчикам, завершенные тремя разными самайликами подходящих под описание.
 ";
 
+    // Инлайн‑вставка изображения через data URL, чтобы обойтись без внешнего хостинга
     let mime = guess_mime(bytes);
     let b64 = general_purpose::STANDARD.encode(bytes);
     let data_url = format!("data:{};base64,{}", mime, b64);
 
+    // Тело Chat Completions запроса (Vision поддерживается через тип content=image_url)
     let body = json!({
         "model": model,
         "temperature": 0.9,
@@ -114,6 +128,7 @@ pub async fn generate_caption_openai_vision(stats: &ImageStats, bytes: &[u8]) ->
         warn!(status = %status, body = %val, "OpenAI vision error");
         return Err(anyhow!("openai error: {}", val));
     }
+    // Достаём текст ассистента и ограничиваем ~1000 символов
     let content = val["choices"][0]["message"]["content"].as_str()
         .ok_or_else(|| anyhow!("openai response missing content"))?;
     let capped = content.chars().take(1000).collect::<String>();
