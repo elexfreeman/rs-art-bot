@@ -426,12 +426,22 @@ async fn handle_photo(
     let file_id = Some(best.file.id.to_string());
     db.log_post(channel_id, Some(msg_id as i64), file_id, Some(caption)).await?;
 
-    // Подтверждаем пользователю публикацию
-    bot.send_message(
-        msg.chat.id,
-        "Пост опубликован в канал. Спасибо!",
-    )
-    .await?;
+    // Дублируем опубликованный пост в чат с пользователем
+    bot
+        .forward_message(
+            msg.chat.id,
+            teloxide::types::ChatId(channel_id),
+            sent.id,
+        )
+        .await?;
+
+    // Дополнительное подтверждение пользователю
+    bot
+        .send_message(
+            msg.chat.id,
+            "Пост опубликован в канал и продублирован сюда.",
+        )
+        .await?;
 
     Ok(())
 }
