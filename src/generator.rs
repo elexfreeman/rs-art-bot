@@ -1,9 +1,9 @@
 use anyhow::{anyhow, Context, Result};
+use base64::{engine::general_purpose, Engine as _};
 use image::io::Reader as ImageReader;
+use image::ImageFormat;
 use image::{DynamicImage, GenericImageView};
 use serde_json::json;
-use base64::{engine::general_purpose, Engine as _};
-use image::ImageFormat;
 use tracing::{debug, info, warn};
 
 /// Небольшой набор метрик изображения для генерации подписи.
@@ -28,7 +28,12 @@ pub fn analyze_image(bytes: &[u8]) -> Result<ImageStats> {
 
     let (w, h) = img.dimensions();
     let palette = dominant_colors(&img, 3);
-    debug!(width = w, height = h, colors = palette.len(), "analyze_image: рассчитана статистика");
+    debug!(
+        width = w,
+        height = h,
+        colors = palette.len(),
+        "analyze_image: рассчитана статистика"
+    );
 
     Ok(ImageStats {
         width: w,
@@ -82,12 +87,19 @@ fn guess_mime(bytes: &[u8]) -> &'static str {
 /// Функция генерирует подпись с помощью OpenAI Vision по данным `stats` и байтам изображения.
 pub async fn generate_caption_openai_vision(stats: &ImageStats, bytes: &[u8]) -> Result<String> {
     let api_key = std::env::var("OPENAI_API_KEY").context("переменная OPENAI_API_KEY не задана")?;
-    let model = std::env::var("OPENAI_VISION_MODEL").unwrap_or_else(|_| std::env::var("OPENAI_MODEL").unwrap_or_else(|_| "gpt-4o-mini".to_string()));
-    let base = std::env::var("OPENAI_BASE").unwrap_or_else(|_| "https://api.openai.com".to_string());
+    let model = std::env::var("OPENAI_VISION_MODEL").unwrap_or_else(|_| {
+        std::env::var("OPENAI_MODEL").unwrap_or_else(|_| "gpt-4o-mini".to_string())
+    });
+    let base =
+        std::env::var("OPENAI_BASE").unwrap_or_else(|_| "https://api.openai.com".to_string());
     debug!(model = %model, base = %base, "Запрос к OpenAI Vision");
 
     // Сформируем небольшой контекст по тонам (если есть)
-    let tones = if stats.dominant_hex.is_empty() { "неопределены".to_string() } else { stats.dominant_hex.join(", ") };
+    let tones = if stats.dominant_hex.is_empty() {
+        "неопределены".to_string()
+    } else {
+        stats.dominant_hex.join(", ")
+    };
     let system = "Ты генерируешь описание для поста в соцсеть.
 Ты професиональный составитель текстов для описания картин, выдающийся эксперт в этой области.
 Картины написаны акварелью.
@@ -95,6 +107,7 @@ pub async fn generate_caption_openai_vision(stats: &ImageStats, bytes: &[u8]) ->
 Стиль легкий и нежный. Слог простой и вдохновляющий. Ориентируйся на стиль Пушкина.
 Описывай что нарисовано во вложении.
 Пост должен быть продающим, сделай акциент на том какая это замечательная, эксклющивная и индивидуальная работа.
+В начале поста пиши название картины, генерируй на основании изображения.
 В конце каждого поста добавляй добрые и радостные пожелания подписчикам, завершенные тремя разными самайликами подходящих под описание.
 Эти смайлики пиши с новой строки.
 ";
@@ -134,7 +147,8 @@ pub async fn generate_caption_openai_vision(stats: &ImageStats, bytes: &[u8]) ->
         return Err(anyhow!("openai error: {}", val));
     }
     // Достаём текст ассистента и ограничиваем ~1000 символов
-    let content = val["choices"][0]["message"]["content"].as_str()
+    let content = val["choices"][0]["message"]["content"]
+        .as_str()
         .ok_or_else(|| anyhow!("openai response missing content"))?;
     let capped = content.chars().take(1000).collect::<String>();
     debug!(len = capped.len(), "Ответ OpenAI Vision обработан");
