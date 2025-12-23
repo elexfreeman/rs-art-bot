@@ -32,6 +32,7 @@ https://api.telegram.org/bot{our_bot_token}/getUpdates
    # (опц.) OPENAI_BASE=https://api.openai.com # кастомный base URL (прокси)
    # (опц.) OPENAI_USE_VISION=true    # включить анализ изображения (Vision)
    # (опц.) OPENAI_VISION_MODEL=gpt-4o  # модель для Vision (gpt-4o(-mini) и др.)
+   OPENAI_SYSTEM_PROMPT="..."        # системный промпт для Vision-генерации подписи
 
 5) Соберите и запустите:
 

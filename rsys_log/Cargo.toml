@@ -1,0 +1,9 @@
+[package]
+name = "rsys_log"
+version = "0.1.0"
+edition = "2021"
+description = "LCARS-style logging formatter for RS-CRM services"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }

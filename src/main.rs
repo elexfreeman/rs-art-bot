@@ -1,22 +1,23 @@
 // Основной исполняемый модуль: запускает бота, настраивает логирование,
 // подключает SQLite, поднимает обработчики и фоновые задачи (интервал/крон).
-mod generator;
 mod db;
+mod generator;
+mod logging;
 
 use anyhow::{Context, Result};
 use teloxide::dispatching::UpdateFilterExt;
-use teloxide::prelude::*;
-use teloxide::types::PhotoSize;
 use teloxide::dptree;
+use teloxide::prelude::*;
 use teloxide::requests::Requester;
+use teloxide::types::PhotoSize;
 use teloxide::utils::command::BotCommands as _; // bring trait into scope for descriptions()
-use tracing::{debug, error, info, warn};
 
 use crate::db::Db;
-use crate::generator::{analyze_image, generate_caption_openai_vision};
+use crate::generator::generate_caption_openai_vision;
+use crate::logging::{compact, init_logging, log, Level};
 use sha2::{Digest, Sha256};
-use tokio::time::{interval, Duration};
 use time::OffsetDateTime;
+use tokio::time::{interval, Duration};
 // duplicate imports removed
 
 /// Точка входа: загружает .env, настраивает логирование, подключает SQLite,
@@ -24,24 +25,37 @@ use time::OffsetDateTime;
 #[tokio::main]
 async fn main() -> Result<()> {
     // 1) Подхватить переменные окружения из .env, если файл присутствует
-    dotenvy::dotenv().ok();
-    // 2) Инициализировать логирование через tracing с возможностью управлять уровнем через RUST_LOG
-    let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info,reqwest=warn,teloxide=info"));
-    tracing_subscriber::fmt().with_env_filter(env_filter).compact().init();
-
+    dotenv::dotenv().ok();
+    // 2) Инициализировать логирование через rsys_log (уровень из RSYS_LOG_LEVEL/RUST_LOG)
+    init_logging();
+    let system = std::env::var("OPENAI_SYSTEM_PROMPT").unwrap_or_else(|_| {
+        log(
+            "openai",
+            "vision",
+            Level::Error,
+            "Отсутствует OPENAI_SYSTEM_PROMPT",
+        )
+        .print();
+        "NONT".to_string()
+    });
     // 3) Инициализировать Telegram‑бота: токен читается из переменной TELOXIDE_TOKEN
     let bot = Bot::from_env();
 
     // 4) Подключить SQLite: открыть/создать базу и применить схему
     let db_path = std::env::var("DB_PATH").unwrap_or_else(|_| "bot.db".to_string());
-    let db = Db::open(&db_path).await.context("не удалось открыть базу SQLite")?;
+    let db = Db::open(&db_path)
+        .await
+        .context("не удалось открыть базу SQLite")?;
     let db = std::sync::Arc::new(db);
 
     // 5) Если channel_id ещё не задан в БД — взять стартовое значение из .env (CHANNEL_ID)
     if db.get_channel_id().await?.is_none() {
-        let env_channel = std::env::var("CHANNEL_ID").ok().and_then(|v| v.parse::<i64>().ok());
-        if let Some(id) = env_channel { db.set_channel_id(id).await?; }
+        let env_channel = std::env::var("CHANNEL_ID")
+            .ok()
+            .and_then(|v| v.parse::<i64>().ok());
+        if let Some(id) = env_channel {
+            db.set_channel_id(id).await?;
+        }
     }
 
     // 6) Запустить фоновую публикацию из папки:
@@ -74,13 +88,21 @@ async fn main() -> Result<()> {
     // 7) Для наглядности — вывести информацию о боте
     match bot.get_me().await {
         Ok(me) => {
-            info!(
-                id = me.id.0,
-                username = me.user.username.as_deref().unwrap_or(""),
-                "Бот запущен"
-            );
+            log("bot", "startup", Level::Info, "Бот запущен")
+                .data("id", me.id.0.to_string())
+                .data("username", me.user.username.as_deref().unwrap_or(""))
+                .print();
         }
-        Err(err) => warn!(error = %err, "Не удалось получить информацию о боте"),
+        Err(err) => {
+            log(
+                "bot",
+                "startup",
+                Level::Warn,
+                "Не удалось получить информацию о боте",
+            )
+            .data("error", err.to_string())
+            .print();
+        }
     }
 
     // 8) Сконструировать дерево обработчиков: команды и фото
@@ -90,10 +112,7 @@ async fn main() -> Result<()> {
                 .filter_command::<BotCommand>()
                 .endpoint(handle_commands),
         )
-        .branch(
-            dptree::filter(|msg: Message| msg.photo().is_some())
-                .endpoint(handle_photo),
-        );
+        .branch(dptree::filter(|msg: Message| msg.photo().is_some()).endpoint(handle_photo));
 
     // 9) Запустить диспетчер: передаём зависимостью `db`
     Dispatcher::builder(bot, handler)
@@ -113,7 +132,14 @@ async fn run_periodic_poster(bot: Bot, db: std::sync::Arc<Db>, files_dir: String
     loop {
         ticker.tick().await;
         if let Err(err) = try_post_from_folder(&bot, &db, &files_dir).await {
-            warn!(error = %err, "Ошибка периодической публикации");
+            log(
+                "poster",
+                "interval",
+                Level::Warn,
+                "Ошибка периодической публикации",
+            )
+            .data("error", err.to_string())
+            .print();
         }
     }
 }
@@ -124,7 +150,15 @@ async fn run_cron_poster(bot: Bot, db: std::sync::Arc<Db>, files_dir: String, cr
     let spec = match parse_simple_cron(&cron) {
         Ok(s) => s,
         Err(e) => {
-            warn!(error = %e, value = %cron, "Некорректное выражение cron, пропускаем");
+            log(
+                "poster",
+                "cron",
+                Level::Warn,
+                "Некорректное выражение cron, пропускаем",
+            )
+            .data("error", e.to_string())
+            .data("value", cron)
+            .print();
             return;
         }
     };
@@ -138,11 +172,15 @@ async fn run_cron_poster(bot: Bot, db: std::sync::Arc<Db>, files_dir: String, cr
         let now_local = OffsetDateTime::now_local().unwrap_or_else(|_| OffsetDateTime::now_utc());
         let m = now_local.minute() as i32;
         let h = now_local.hour() as i32;
-        if last_minute == Some(m) { continue; }
+        if last_minute == Some(m) {
+            continue;
+        }
         if cron_match_min_hour(&spec, m as u8, h as u8) {
             last_minute = Some(m);
             if let Err(err) = try_post_from_folder(&bot, &db, &files_dir).await {
-                warn!(error = %err, "Ошибка публикации по cron");
+                log("poster", "cron", Level::Warn, "Ошибка публикации по cron")
+                    .data("error", err.to_string())
+                    .print();
             }
         }
     }
@@ -158,7 +196,9 @@ struct CronMinHour {
 fn parse_simple_cron(s: &str) -> Result<CronMinHour> {
     // Ждём ровно 5 полей, поддерживаем только минуту и час, остальные должны быть '*'
     let parts: Vec<_> = s.split_whitespace().collect();
-    if parts.len() != 5 { anyhow::bail!("cron must have 5 fields"); }
+    if parts.len() != 5 {
+        anyhow::bail!("cron must have 5 fields");
+    }
     let minute = parse_field_minute_hour(parts[0])?;
     let hour = parse_field_minute_hour(parts[1])?;
     if parts[2] != "*" || parts[3] != "*" || parts[4] != "*" {
@@ -170,7 +210,9 @@ fn parse_simple_cron(s: &str) -> Result<CronMinHour> {
 /// Парсит поле крона для минут/часов: `*` либо число u8.
 fn parse_field_minute_hour(v: &str) -> Result<Option<u8>> {
     // '*' означает любое значение, иначе парсим число
-    if v == "*" { return Ok(None); }
+    if v == "*" {
+        return Ok(None);
+    }
     let n: u8 = v.parse().context("некорректное число в cron")?;
     Ok(Some(n))
 }
@@ -186,7 +228,13 @@ fn cron_match_min_hour(spec: &CronMinHour, minute: u8, hour: u8) -> bool {
 async fn try_post_from_folder(bot: &Bot, db: &std::sync::Arc<Db>, files_dir: &str) -> Result<()> {
     // 1) Убедиться, что задан канал для публикации
     let Some(channel_id) = db.get_channel_id().await? else {
-        debug!("Канал не настроен, пропускаем");
+        log(
+            "poster",
+            "files",
+            Level::Debug,
+            "Канал не настроен, пропускаем",
+        )
+        .print();
         return Ok(());
     };
 
@@ -199,47 +247,92 @@ async fn try_post_from_folder(bot: &Bot, db: &std::sync::Arc<Db>, files_dir: &st
             }
         }
         Err(err) => {
-            warn!(dir = files_dir, error = %err, "Не удалось прочитать каталог файлов");
+            log(
+                "poster",
+                "files",
+                Level::Warn,
+                "Не удалось прочитать каталог файлов",
+            )
+            .data("dir", files_dir)
+            .data("error", err.to_string())
+            .print();
             return Ok(());
         }
     }
 
-    if entries.is_empty() { return Ok(()); }
+    if entries.is_empty() {
+        return Ok(());
+    }
 
     // 3) Отсортировать по имени для детерминированного порядка
     entries.sort_by_key(|e| e.path());
 
     // 4) Фильтровать по поддерживаемым расширениям
     fn is_image(p: &std::path::Path) -> bool {
-        match p.extension().and_then(|s| s.to_str()).map(|s| s.to_lowercase()) {
-            Some(ext) if matches!(ext.as_str(), "jpg"|"jpeg"|"png"|"webp"|"gif"|"bmp"|"tiff") => true,
+        match p
+            .extension()
+            .and_then(|s| s.to_str())
+            .map(|s| s.to_lowercase())
+        {
+            Some(ext)
+                if matches!(
+                    ext.as_str(),
+                    "jpg" | "jpeg" | "png" | "webp" | "gif" | "bmp" | "tiff"
+                ) =>
+            {
+                true
+            }
             _ => false,
         }
     }
 
     for e in entries {
         let path = e.path();
-        if !is_image(&path) { continue; }
+        if !is_image(&path) {
+            continue;
+        }
 
         // 5) Прочитать файл и посчитать SHA‑256, чтобы избежать повторов
         let bytes = match tokio::fs::read(&path).await {
             Ok(b) => b,
-            Err(err) => { warn!(file = ?path, error = %err, "Ошибка чтения файла"); continue; }
+            Err(err) => {
+                log("poster", "files", Level::Warn, "Ошибка чтения файла")
+                    .data("file", path.display().to_string())
+                    .data("error", err.to_string())
+                    .print();
+                continue;
+            }
         };
         let mut hasher = Sha256::new();
         hasher.update(&bytes);
         let hash = format!("{:x}", hasher.finalize());
 
         if db.has_file_hash(&hash).await? {
-            debug!(file = ?path, "Файл уже опубликован, пропускаем");
+            log(
+                "poster",
+                "files",
+                Level::Debug,
+                "Файл уже опубликован, пропускаем",
+            )
+            .data("file", path.display().to_string())
+            .print();
             continue;
         }
 
         // 6) Подготовить подпись: анализ изображения + вызов Vision
-        let stats = analyze_image(&bytes)?;
-        let caption = match generate_caption_openai_vision(&stats, &bytes).await {
+        let caption = match generate_caption_openai_vision(&bytes).await {
             Ok(c) => c,
-            Err(err) => { warn!(error = %err, "Не удалось сгенерировать подпись, используем пустую"); String::new() }
+            Err(err) => {
+                log(
+                    "poster",
+                    "caption",
+                    Level::Warn,
+                    "Не удалось сгенерировать подпись, используем пустую",
+                )
+                .data("error", err.to_string())
+                .print();
+                String::new()
+            }
         };
 
         // 7) Отправить фото в канал (с диска)
@@ -258,10 +351,14 @@ async fn try_post_from_folder(bot: &Bot, db: &std::sync::Arc<Db>, files_dir: &st
             .map(|p| p.file.id.to_string());
 
         // 9) Записать лог публикации и сохранить хэш файла
-        db.log_post(channel_id, Some(sent.id.0 as i64), file_id, Some(caption)).await?;
-        db.insert_file_hash(&hash, path.to_string_lossy().as_ref()).await?;
+        db.log_post(channel_id, Some(sent.id.0 as i64), file_id, Some(caption))
+            .await?;
+        db.insert_file_hash(&hash, path.to_string_lossy().as_ref())
+            .await?;
 
-        info!(?path, "Опубликован один файл");
+        log("poster", "files", Level::Info, "Опубликован один файл")
+            .data("file", path.display().to_string())
+            .print();
         // Post only one per tick
         break;
     }
@@ -272,13 +369,13 @@ async fn try_post_from_folder(bot: &Bot, db: &std::sync::Arc<Db>, files_dir: &st
 #[derive(Debug, teloxide::macros::BotCommands, Clone)]
 #[command(description = "Доступные команды:")]
 enum BotCommand {
-    #[command(description = "Показать помощь")] 
+    #[command(description = "Показать помощь")]
     Help,
-    #[command(description = "Проверка состояния")] 
+    #[command(description = "Проверка состояния")]
     Start,
-    #[command(description = "Установить канал: /set_channel -1001234567890")] 
+    #[command(description = "Установить канал: /set_channel -1001234567890")]
     SetChannel(String),
-    #[command(description = "Показать текущие настройки")] 
+    #[command(description = "Показать текущие настройки")]
     Settings,
 }
 
@@ -290,14 +387,25 @@ async fn handle_commands(
     db: std::sync::Arc<Db>,
 ) -> Result<()> {
     // Диспетчер команд: логируем и обрабатываем согласно enum BotCommand
-    info!(chat_id = %msg.chat.id, from = ?msg.from.as_ref().map(|u| u.id.0), command = ?cmd, "Получена команда");
+    log("tg", "commands", Level::Info, "Получена команда")
+        .data("chat_id", msg.chat.id.to_string())
+        .data(
+            "from",
+            msg.from
+                .as_ref()
+                .map(|u| u.id.0.to_string())
+                .unwrap_or_else(|| "-".to_string()),
+        )
+        .data("command", format!("{:?}", cmd))
+        .print();
     match cmd {
         BotCommand::Help => {
             // Автоматически сгенерированное описание команд
             let text = BotCommand::descriptions().to_string();
-            debug!(len = text.len(), "Отправка помощи");
-            bot.send_message(msg.chat.id, text)
-                .await?;
+            log("tg", "commands", Level::Debug, "Отправка помощи")
+                .data("len", text.len().to_string())
+                .print();
+            bot.send_message(msg.chat.id, text).await?;
         }
         BotCommand::Start => {
             // Короткое приветствие/проверка готовности
@@ -307,18 +415,29 @@ async fn handle_commands(
         BotCommand::SetChannel(raw) => {
             // Устанавливаем числовой ID канала и сохраняем в SQLite
             let trimmed = raw.trim();
-            // Require numeric chat id for reliability (-100...) 
+            // Require numeric chat id for reliability (-100...)
             let parsed = trimmed.parse::<i64>();
             match parsed {
                 Ok(id) => {
                     // Persist to SQLite as well
                     db.set_channel_id(id).await?;
-                    info!(chat_id = %msg.chat.id, channel_id = id, "Канал установлен");
+                    log("tg", "commands", Level::Info, "Канал установлен")
+                        .data("chat_id", msg.chat.id.to_string())
+                        .data("channel_id", id.to_string())
+                        .print();
                     bot.send_message(msg.chat.id, format!("Канал установлен: {}", trimmed))
                         .await?;
                 }
                 Err(_) => {
-                    warn!(chat_id = %msg.chat.id, value = trimmed, "Некорректный формат ID канала");
+                    log(
+                        "tg",
+                        "commands",
+                        Level::Warn,
+                        "Некорректный формат ID канала",
+                    )
+                    .data("chat_id", msg.chat.id.to_string())
+                    .data("value", trimmed)
+                    .print();
                     bot.send_message(
                         msg.chat.id,
                         "Укажите числовой ID канала (например -1001234567890).",
@@ -334,7 +453,9 @@ async fn handle_commands(
                 Some(id) => format!("Канал: {}", id),
                 None => "Канал не настроен. Используйте /set_channel <id>".to_string(),
             };
-            debug!(chat_id = %msg.chat.id, "Отправка настроек");
+            log("tg", "commands", Level::Debug, "Отправка настроек")
+                .data("chat_id", msg.chat.id.to_string())
+                .print();
             bot.send_message(msg.chat.id, text).await?;
         }
     }
@@ -343,13 +464,11 @@ async fn handle_commands(
 
 /// Обработчик входящего фото: скачивает байты, анализирует и генерирует подпись через Vision,
 /// публикует в канал, пишет лог публикации и отправляет подтверждение пользователю.
-async fn handle_photo(
-    bot: Bot,
-    msg: Message,
-    db: std::sync::Arc<Db>,
-) -> Result<()> {
+async fn handle_photo(bot: Bot, msg: Message, db: std::sync::Arc<Db>) -> Result<()> {
     // Обрабатываем только сообщения с фото
-    let Some(photos) = msg.photo() else { return Ok(()); };
+    let Some(photos) = msg.photo() else {
+        return Ok(());
+    };
 
     // Choose the biggest photo variant
     let best: &PhotoSize = photos
@@ -357,20 +476,27 @@ async fn handle_photo(
         .max_by_key(|p| p.width as i64 * p.height as i64)
         .expect("photo list not empty");
 
-    info!(
-        chat_id = %msg.chat.id,
-        from = ?msg.from.as_ref().map(|u| u.id.0),
-        count = photos.len(),
-        chosen_w = best.width,
-        chosen_h = best.height,
-        file_id = %best.file.id,
-        "Получено фото"
-    );
+    log("tg", "photo", Level::Info, "Получено фото")
+        .data("chat_id", msg.chat.id.to_string())
+        .data(
+            "from",
+            msg.from
+                .as_ref()
+                .map(|u| u.id.0.to_string())
+                .unwrap_or_else(|| "-".to_string()),
+        )
+        .data("count", photos.len().to_string())
+        .data("chosen_w", best.width.to_string())
+        .data("chosen_h", best.height.to_string())
+        .data("file_id", best.file.id.to_string())
+        .print();
 
     // Убедимся, что канал настроен
     let channel_id = db.get_channel_id().await?;
     if channel_id.is_none() {
-        warn!(chat_id = %msg.chat.id, "Канал не настроен");
+        log("tg", "photo", Level::Warn, "Канал не настроен")
+            .data("chat_id", msg.chat.id.to_string())
+            .print();
         bot.send_message(
             msg.chat.id,
             "Сначала настройте канал: /set_channel -1001234567890",
@@ -383,11 +509,10 @@ async fn handle_photo(
     // Скачиваем оригинальные байты фото для анализа (Vision получает data URL)
     let file = bot.get_file(best.file.id.clone()).await?;
     let token = std::env::var("TELOXIDE_TOKEN").unwrap_or_default();
-    let file_url = format!(
-        "https://api.telegram.org/file/bot{}/{}",
-        token, file.path
-    );
-    debug!(%file_url, "Скачивание изображения");
+    let file_url = format!("https://api.telegram.org/file/bot{}/{}", token, file.path);
+    log("tg", "photo", Level::Debug, "Скачивание изображения")
+        .data("file_url", file_url.clone())
+        .print();
     let bytes = reqwest::Client::new()
         .get(file_url)
         .send()
@@ -396,52 +521,64 @@ async fn handle_photo(
         .bytes()
         .await
         .context("не удалось прочитать байты изображения")?;
-    debug!(size = bytes.len(), "Изображение скачано");
+    log("tg", "photo", Level::Debug, "Изображение скачано")
+        .data("size", bytes.len().to_string())
+        .print();
 
     // Анализ изображения и генерация подписи через OpenAI Vision
-     let stats = analyze_image(&bytes)?;
-     debug!(w = stats.width, h = stats.height, colors = stats.dominant_hex.len(), "Изображение проанализировано");
-     let caption = match generate_caption_openai_vision(&stats, &bytes).await {
-         Ok(c) => {
-             info!("результат = {}", c);
-             info!(len = c.len(), "Подпись сгенерирована");
-             c
-         }
-         Err(err) => {
-             error!(error = %err, "Не удалось сгенерировать подпись, используем пустую");
-             String::new()
-         }
-     };
+    let caption = match generate_caption_openai_vision(&bytes).await {
+        Ok(c) => {
+            log("ai", "vision", Level::Info, "Подпись сгенерирована")
+                .data("len", c.len().to_string())
+                .data("result", compact(&c, 160))
+                .print();
+            c
+        }
+        Err(err) => {
+            log(
+                "ai",
+                "vision",
+                Level::Error,
+                "Не удалось сгенерировать подпись, используем пустую",
+            )
+            .data("error", err.to_string())
+            .print();
+            String::new()
+        }
+    };
 
     // Публикуем в канал: переиспользуем file_id исходного фото, чтобы не перезагружать файл
-    info!(channel_id, "Публикация в канал");
+    log("tg", "photo", Level::Info, "Публикация в канал")
+        .data("channel_id", channel_id.to_string())
+        .print();
     // let caption = String::from("HEllow");
-    let sent = bot.send_photo(teloxide::types::ChatId(channel_id), teloxide::types::InputFile::file_id(best.file.id.clone()))
+    let sent = bot
+        .send_photo(
+            teloxide::types::ChatId(channel_id),
+            teloxide::types::InputFile::file_id(best.file.id.clone()),
+        )
         .caption(caption.clone())
         .await?;
-    info!(channel_id, "Опубликовано в канал");
+    log("tg", "photo", Level::Info, "Опубликовано в канал")
+        .data("channel_id", channel_id.to_string())
+        .print();
 
     // Log publication to SQLite
     let msg_id = sent.id.0;
     let file_id = Some(best.file.id.to_string());
-    db.log_post(channel_id, Some(msg_id as i64), file_id, Some(caption)).await?;
+    db.log_post(channel_id, Some(msg_id as i64), file_id, Some(caption))
+        .await?;
 
     // Дублируем опубликованный пост в чат с пользователем
-    bot
-        .forward_message(
-            msg.chat.id,
-            teloxide::types::ChatId(channel_id),
-            sent.id,
-        )
+    bot.forward_message(msg.chat.id, teloxide::types::ChatId(channel_id), sent.id)
         .await?;
 
     // Дополнительное подтверждение пользователю
-    bot
-        .send_message(
-            msg.chat.id,
-            "Пост опубликован в канал и продублирован сюда.",
-        )
-        .await?;
+    bot.send_message(
+        msg.chat.id,
+        "Пост опубликован в канал и продублирован сюда.",
+    )
+    .await?;
 
     Ok(())
 }
