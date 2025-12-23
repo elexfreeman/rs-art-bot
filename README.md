@@ -12,54 +12,49 @@ rs-bot-art — Telegram-бот для акварельных работ
 3) Узнайте числовой ID канала (формат -100xxxxxxxxxxxx).
 https://api.telegram.org/bot{our_bot_token}/getUpdates
    - Самый простой способ — переслать любое сообщение из канала боту @userinfobot или @getidsbot.
-4) Создайте файл .env в корне проекта:
+4) Создайте JSON‑конфиг (можно взять `config.sample.json` как основу):
 
-   TELOXIDE_TOKEN=123456:ABC-DEF...   # токен вашего бота
-   # Стартовые настройки (могут быть изменены командой в чате):
-   CHANNEL_ID=-1001234567890          # числовой ID канала (опц.)
-   
-   # Планировщик публикаций (любой из вариантов):
-   POST_INTERVAL_SECS=0               # интервал в секундах (0 = выключено)
-   POST_CRON=* * * * *                # либо крон "M H * * *" (пример: "30 10 * * *")
-
-   # Папка и БД
-   FILES_DIR=files                    # папка с изображениями
-   DB_PATH=bot.db                     # путь к SQLite базе
-
-   # OpenAI (опционально)
-   OPENAI_API_KEY=sk-...              # ключ OpenAI для генерации текста
-   # (опц.) OPENAI_MODEL=gpt-4o-mini  # модель; по умолчанию gpt-4o-mini
-   # (опц.) OPENAI_BASE=https://api.openai.com # кастомный base URL (прокси)
-   # (опц.) OPENAI_USE_VISION=true    # включить анализ изображения (Vision)
-   # (опц.) OPENAI_VISION_MODEL=gpt-4o  # модель для Vision (gpt-4o(-mini) и др.)
-   OPENAI_SYSTEM_PROMPT="..."        # системный промпт для Vision-генерации подписи
+   {
+     "teloxide_token": "123456:ABC-DEF...",
+     "channel_id": -1001234567890,
+     "post_interval_secs": 0,
+     "post_cron": "30 10 * * *",
+     "files_dir": "files",
+     "db_path": "bot.db",
+     "openai_api_key": "sk-...",
+     "openai_model": "gpt-4o-mini",
+     "openai_base": "https://api.openai.com",
+     "openai_use_vision": true,
+     "openai_vision_model": "gpt-4o",
+     "openai_system_prompt": "..."
+   }
 
 5) Соберите и запустите:
 
-   cargo run --release
+   cargo run --release -- --config config.json
 
 6) В личку боту отправьте команду:
 
    /set_channel -1001234567890
 
 7) Теперь отправьте боту фото — он сгенерирует текст и опубликует пост в канал.
-8) Для авто‑публикаций: сложите изображения в папку `files`, задайте `POST_INTERVAL_SECS>0` или `POST_CRON`, перезапустите бота.
+8) Для авто‑публикаций: сложите изображения в папку `files`, задайте `post_interval_secs>0` или `post_cron`, перезапустите бота.
 
 Конфигурация
-- Конфиг только через .env. Файла `config.json` нет.
-- `CHANNEL_ID` из .env используется один раз при первом запуске, затем актуальное значение хранится в SQLite и меняется командой `/set_channel`.
+- Конфиг только через JSON‑файл с передачей `--config path/to/config.json` при запуске.
+- `channel_id` из JSON используется один раз при первом запуске, затем актуальное значение хранится в SQLite и меняется командой `/set_channel`.
 - Планировщик:
-  - Если `POST_INTERVAL_SECS > 0` — публикует каждые N секунд.
-  - Иначе, если задан `POST_CRON` — запускает по расписанию вида "M H * * *" (минуты/часы или `*`).
+  - Если `post_interval_secs > 0` — публикует каждые N секунд.
+  - Иначе, если задан `post_cron` — запускает по расписанию вида "M H * * *" (минуты/часы или `*`).
   - Время берётся по локальному времени системы.
 
 Фоновая публикация из папки
-- Папка: `FILES_DIR` (по умолчанию `files`).
+- Папка: `files_dir` (по умолчанию `files`).
 - На каждом срабатывании берётся первый подходящий файл (jpg/png/webp/gif/bmp/tiff) по имени, для него считается SHA‑256.
 - Если хэш уже есть в БД — файл пропускается, берётся следующий. Иначе публикуется и хэш сохраняется.
 
 База данных (SQLite)
-- Путь к базе: `DB_PATH` (по умолчанию `bot.db`).
+- Путь к базе: `db_path` (по умолчанию `bot.db`).
 - Таблицы:
   - `config(key TEXT PRIMARY KEY, value TEXT)` — хранит `channel_id`.
   - `files(hash TEXT PRIMARY KEY, path TEXT, created_at INTEGER)` — учёт уже опубликованных файлов по хэшу.

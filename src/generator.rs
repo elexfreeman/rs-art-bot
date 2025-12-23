@@ -3,6 +3,7 @@ use base64::{engine::general_purpose, Engine as _};
 use image::ImageFormat;
 use serde_json::json;
 
+use crate::config::Config;
 use crate::logging::{compact, log, Level};
 
 const DEFAULT_SYSTEM_PROMPT: &str = "
@@ -34,28 +35,25 @@ fn guess_mime(bytes: &[u8]) -> &'static str {
 /// и системный промпт под акварельные работы. Результат укорачиваем,
 /// чтобы уложиться в лимит подписи Telegram.
 /// Функция генерирует подпись с помощью OpenAI Vision по данным `stats` и байтам изображения.
-pub async fn generate_caption_openai_vision(bytes: &[u8]) -> Result<String> {
-    let api_key = std::env::var("OPENAI_API_KEY").context("переменная OPENAI_API_KEY не задана")?;
-    let model = std::env::var("OPENAI_VISION_MODEL").unwrap_or_else(|_| {
-        std::env::var("OPENAI_MODEL").unwrap_or_else(|_| "gpt-5.2".to_string())
-    });
-    let base =
-        std::env::var("OPENAI_BASE").unwrap_or_else(|_| "https://api.openai.com".to_string());
+pub async fn generate_caption_openai_vision(bytes: &[u8], cfg: &Config) -> Result<String> {
+    let api_key = cfg
+        .openai_api_key
+        .clone()
+        .context("параметр openai_api_key не задан в конфиге")?;
+    let model = cfg
+        .openai_vision_model
+        .clone()
+        .unwrap_or_else(|| cfg.openai_model.clone());
+    let base = cfg.openai_base.clone();
     log("openai", "vision", Level::Debug, "Запрос к OpenAI Vision")
         .data("model", model.clone())
         .data("base", base.clone())
         .print();
 
-    let system = std::env::var("OPENAI_SYSTEM_PROMPT").unwrap_or_else(|_| {
-        log(
-            "openai",
-            "vision",
-            Level::Error,
-            "Отсутствует OPENAI_SYSTEM_PROMPT",
-        )
-        .print();
-        DEFAULT_SYSTEM_PROMPT.to_string()
-    });
+    let system = cfg
+        .openai_system_prompt
+        .clone()
+        .unwrap_or_else(|| DEFAULT_SYSTEM_PROMPT.to_string());
 
     // Инлайн‑вставка изображения через data URL, чтобы обойтись без внешнего хостинга
     let mime = guess_mime(bytes);

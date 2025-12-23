@@ -2,6 +2,7 @@
 // подключает SQLite, поднимает обработчики и фоновые задачи (интервал/крон).
 mod db;
 mod generator;
+mod config;
 mod logging;
 
 use anyhow::{Context, Result};
@@ -12,6 +13,7 @@ use teloxide::requests::Requester;
 use teloxide::types::PhotoSize;
 use teloxide::utils::command::BotCommands as _; // bring trait into scope for descriptions()
 
+use crate::config::{load_config, Config};
 use crate::db::Db;
 use crate::generator::generate_caption_openai_vision;
 use crate::logging::{compact, init_logging, log, Level};
@@ -19,30 +21,41 @@ use sha2::{Digest, Sha256};
 use time::OffsetDateTime;
 use tokio::time::{interval, Duration};
 // duplicate imports removed
+fn parse_config_arg() -> Result<Option<String>> {
+    let mut args = std::env::args().skip(1);
+    while let Some(arg) = args.next() {
+        if arg == "--config" {
+            let path = args.next().ok_or_else(|| {
+                anyhow::anyhow!("ожидается путь после аргумента --config")
+            })?;
+            return Ok(Some(path));
+        }
+        if let Some(path) = arg.strip_prefix("--config=") {
+            return Ok(Some(path.to_string()));
+        }
+    }
+    Ok(None)
+}
 
 /// Точка входа: загружает .env, настраивает логирование, подключает SQLite,
 /// запускает фоновые задачи (интервал/крон), регистрирует обработчики и запускает диспетчер.
 #[tokio::main]
 async fn main() -> Result<()> {
-    // 1) Подхватить переменные окружения из .env, если файл присутствует
-    dotenv::dotenv().ok();
-    // 2) Инициализировать логирование через rsys_log (уровень из RSYS_LOG_LEVEL/RUST_LOG)
-    init_logging();
-    let system = std::env::var("OPENAI_SYSTEM_PROMPT").unwrap_or_else(|_| {
-        log(
-            "openai",
-            "vision",
-            Level::Error,
-            "Отсутствует OPENAI_SYSTEM_PROMPT",
-        )
+    // 1) Загрузить конфиг из JSON
+    let config_path = parse_config_arg()?
+        .ok_or_else(|| anyhow::anyhow!("ожидается аргумент --config <path>"))?;
+    let config = load_config(&config_path)?;
+    let config = std::sync::Arc::new(config);
+    // 2) Инициализировать логирование
+    init_logging(config.log_level.as_deref());
+    log("config", "load", Level::Info, "Загружен JSON-конфиг")
+        .data("path", config_path)
         .print();
-        "NONT".to_string()
-    });
-    // 3) Инициализировать Telegram‑бота: токен читается из переменной TELOXIDE_TOKEN
-    let bot = Bot::from_env();
+    // 3) Инициализировать Telegram‑бота
+    let bot = Bot::new(config.teloxide_token.clone());
 
     // 4) Подключить SQLite: открыть/создать базу и применить схему
-    let db_path = std::env::var("DB_PATH").unwrap_or_else(|_| "bot.db".to_string());
+    let db_path = config.db_path.clone();
     let db = Db::open(&db_path)
         .await
         .context("не удалось открыть базу SQLite")?;
@@ -50,10 +63,7 @@ async fn main() -> Result<()> {
 
     // 5) Если channel_id ещё не задан в БД — взять стартовое значение из .env (CHANNEL_ID)
     if db.get_channel_id().await?.is_none() {
-        let env_channel = std::env::var("CHANNEL_ID")
-            .ok()
-            .and_then(|v| v.parse::<i64>().ok());
-        if let Some(id) = env_channel {
+        if let Some(id) = config.channel_id {
             db.set_channel_id(id).await?;
         }
     }
@@ -61,26 +71,23 @@ async fn main() -> Result<()> {
     // 6) Запустить фоновую публикацию из папки:
     //    - либо по интервалу (POST_INTERVAL_SECS),
     //    - либо по крону (POST_CRON вида "M H * * *").
-    let files_dir = std::env::var("FILES_DIR").unwrap_or_else(|_| "files".to_string());
-    let post_interval_secs = std::env::var("POST_INTERVAL_SECS")
-        .ok()
-        .and_then(|s| s.parse::<u64>().ok())
-        .unwrap_or(0);
+    let post_interval_secs = config.post_interval_secs;
     if post_interval_secs > 0 {
         let bot_bg = bot.clone();
         let db_bg = db.clone();
+        let config_bg = config.clone();
         tokio::spawn(async move {
-            run_periodic_poster(bot_bg, db_bg, files_dir, post_interval_secs).await;
+            run_periodic_poster(bot_bg, db_bg, config_bg, post_interval_secs).await;
         });
     } else {
         // Use cron from config if provided
-        let cron_expr = std::env::var("POST_CRON").ok();
+        let cron_expr = config.post_cron.clone();
         if let Some(expr) = cron_expr {
             let bot_bg = bot.clone();
             let db_bg = db.clone();
-            let files_dir_bg = files_dir.clone();
+            let config_bg = config.clone();
             tokio::spawn(async move {
-                run_cron_poster(bot_bg, db_bg, files_dir_bg, expr).await;
+                run_cron_poster(bot_bg, db_bg, config_bg, expr).await;
             });
         }
     }
@@ -116,7 +123,7 @@ async fn main() -> Result<()> {
 
     // 9) Запустить диспетчер: передаём зависимостью `db`
     Dispatcher::builder(bot, handler)
-        .dependencies(dptree::deps![db])
+        .dependencies(dptree::deps![db, config])
         .enable_ctrlc_handler()
         .build()
         .dispatch()
@@ -126,12 +133,17 @@ async fn main() -> Result<()> {
 }
 
 /// Фоновая публикация с фиксированным интервалом `every_secs` секунд.
-async fn run_periodic_poster(bot: Bot, db: std::sync::Arc<Db>, files_dir: String, every_secs: u64) {
+async fn run_periodic_poster(
+    bot: Bot,
+    db: std::sync::Arc<Db>,
+    config: std::sync::Arc<Config>,
+    every_secs: u64,
+) {
     // Простой таймер, который раз в N секунд пытается опубликовать один новый файл
     let mut ticker = interval(Duration::from_secs(every_secs));
     loop {
         ticker.tick().await;
-        if let Err(err) = try_post_from_folder(&bot, &db, &files_dir).await {
+        if let Err(err) = try_post_from_folder(&bot, &db, &config, &config.files_dir).await {
             log(
                 "poster",
                 "interval",
@@ -145,7 +157,12 @@ async fn run_periodic_poster(bot: Bot, db: std::sync::Arc<Db>, files_dir: String
 }
 
 /// Фоновая публикация по расписанию `cron` в формате "M H * * *".
-async fn run_cron_poster(bot: Bot, db: std::sync::Arc<Db>, files_dir: String, cron: String) {
+async fn run_cron_poster(
+    bot: Bot,
+    db: std::sync::Arc<Db>,
+    config: std::sync::Arc<Config>,
+    cron: String,
+) {
     // Поддерживаемый формат: "M H * * *", где M и H — число или '*'
     let spec = match parse_simple_cron(&cron) {
         Ok(s) => s,
@@ -177,7 +194,7 @@ async fn run_cron_poster(bot: Bot, db: std::sync::Arc<Db>, files_dir: String, cr
         }
         if cron_match_min_hour(&spec, m as u8, h as u8) {
             last_minute = Some(m);
-            if let Err(err) = try_post_from_folder(&bot, &db, &files_dir).await {
+            if let Err(err) = try_post_from_folder(&bot, &db, &config, &config.files_dir).await {
                 log("poster", "cron", Level::Warn, "Ошибка публикации по cron")
                     .data("error", err.to_string())
                     .print();
@@ -225,7 +242,12 @@ fn cron_match_min_hour(spec: &CronMinHour, minute: u8, hour: u8) -> bool {
 
 /// Пытается найти и опубликовать один новый файл из папки `files_dir`.
 /// Выбирает по имени, пропускает уже виденные по SHA‑256, публикует и логирует.
-async fn try_post_from_folder(bot: &Bot, db: &std::sync::Arc<Db>, files_dir: &str) -> Result<()> {
+async fn try_post_from_folder(
+    bot: &Bot,
+    db: &std::sync::Arc<Db>,
+    config: &Config,
+    files_dir: &str,
+) -> Result<()> {
     // 1) Убедиться, что задан канал для публикации
     let Some(channel_id) = db.get_channel_id().await? else {
         log(
@@ -320,7 +342,7 @@ async fn try_post_from_folder(bot: &Bot, db: &std::sync::Arc<Db>, files_dir: &st
         }
 
         // 6) Подготовить подпись: анализ изображения + вызов Vision
-        let caption = match generate_caption_openai_vision(&bytes).await {
+        let caption = match generate_caption_openai_vision(&bytes, config).await {
             Ok(c) => c,
             Err(err) => {
                 log(
@@ -464,7 +486,12 @@ async fn handle_commands(
 
 /// Обработчик входящего фото: скачивает байты, анализирует и генерирует подпись через Vision,
 /// публикует в канал, пишет лог публикации и отправляет подтверждение пользователю.
-async fn handle_photo(bot: Bot, msg: Message, db: std::sync::Arc<Db>) -> Result<()> {
+async fn handle_photo(
+    bot: Bot,
+    msg: Message,
+    db: std::sync::Arc<Db>,
+    config: std::sync::Arc<Config>,
+) -> Result<()> {
     // Обрабатываем только сообщения с фото
     let Some(photos) = msg.photo() else {
         return Ok(());
@@ -508,8 +535,11 @@ async fn handle_photo(bot: Bot, msg: Message, db: std::sync::Arc<Db>) -> Result<
 
     // Скачиваем оригинальные байты фото для анализа (Vision получает data URL)
     let file = bot.get_file(best.file.id.clone()).await?;
-    let token = std::env::var("TELOXIDE_TOKEN").unwrap_or_default();
-    let file_url = format!("https://api.telegram.org/file/bot{}/{}", token, file.path);
+    let file_url = format!(
+        "https://api.telegram.org/file/bot{}/{}",
+        config.teloxide_token,
+        file.path
+    );
     log("tg", "photo", Level::Debug, "Скачивание изображения")
         .data("file_url", file_url.clone())
         .print();
@@ -526,7 +556,7 @@ async fn handle_photo(bot: Bot, msg: Message, db: std::sync::Arc<Db>) -> Result<
         .print();
 
     // Анализ изображения и генерация подписи через OpenAI Vision
-    let caption = match generate_caption_openai_vision(&bytes).await {
+    let caption = match generate_caption_openai_vision(&bytes, &config).await {
         Ok(c) => {
             log("ai", "vision", Level::Info, "Подпись сгенерирована")
                 .data("len", c.len().to_string())

@@ -1,11 +1,7 @@
 pub use rsys_log::Level;
 
-pub fn init_logging() {
-    let raw = std::env::var("RSYS_LOG_LEVEL")
-        .ok()
-        .or_else(|| std::env::var("RUST_LOG").ok());
-    let level = raw
-        .as_deref()
+pub fn init_logging(raw_level: Option<&str>) {
+    let level = raw_level
         .and_then(|v| v.split(',').next())
         .and_then(|v| Level::from_str(v.trim()))
         .unwrap_or(Level::Info);

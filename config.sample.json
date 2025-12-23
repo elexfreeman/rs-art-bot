@@ -1,0 +1,15 @@
+{
+  "teloxide_token": "123456:ABC-DEF",
+  "channel_id": -1001234567890,
+  "db_path": "bot.db",
+  "files_dir": "files",
+  "post_interval_secs": 0,
+  "post_cron": "30 10 * * *",
+  "openai_api_key": "sk-...",
+  "openai_model": "gpt-4o-mini",
+  "openai_base": "https://api.openai.com",
+  "openai_use_vision": true,
+  "openai_vision_model": "gpt-4o",
+  "openai_system_prompt": "Краткий системный промпт для генерации подписи.",
+  "log_level": "info"
+}
